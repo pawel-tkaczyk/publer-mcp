@@ -1,6 +1,6 @@
 # Publer MCP Server
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that wraps the [Publer](https://app.publer.io) social media scheduling API, letting you manage posts from Claude Code, Claude Desktop, OpenAI Codex CLI, and Gemini CLI.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that wraps the [Publer](https://publer.com/paweltkaczyk) social media scheduling API, letting you manage posts from Claude Code, Claude Desktop, OpenAI Codex CLI, and Gemini CLI.
 
 ## Quick start
 
@@ -17,7 +17,7 @@ The wizard will:
 
 ## Getting your Publer API token
 
-1. Log in at <https://app.publer.io>
+1. Log in at <https://publer.com/paweltkaczyk>
 2. **Profile → Settings → API**
 3. Click **Generate Token** and copy the value
 

@@ -80,6 +80,29 @@ function writeJson(filePath: string, data: unknown) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf-8");
 }
 
+// ── Credential helpers ────────────────────────────────────────────────────────
+
+function findExistingCredentials(): { token?: string; workspaceId?: string } {
+  // Check environment
+  if (process.env.PUBLER_API_TOKEN && process.env.PUBLER_WORKSPACE_ID) {
+    return { token: process.env.PUBLER_API_TOKEN, workspaceId: process.env.PUBLER_WORKSPACE_ID };
+  }
+
+  // Check Gemini CLI config as a primary source
+  const geminiPath = path.join(os.homedir(), ".gemini", "settings.json");
+  if (fs.existsSync(geminiPath)) {
+    const cfg = readJson(geminiPath);
+    const publer = (cfg.mcpServers as any)?.publer;
+    if (publer?.env?.PUBLER_API_TOKEN) {
+      return {
+        token: publer.env.PUBLER_API_TOKEN,
+        workspaceId: publer.env.PUBLER_WORKSPACE_ID,
+      };
+    }
+  }
+  return {};
+}
+
 // ── Agent config writers ──────────────────────────────────────────────────────
 
 interface McpEntry {
@@ -97,6 +120,22 @@ function buildEntry(serverPath: string, token: string, workspaceId: string): Mcp
       PUBLER_WORKSPACE_ID: workspaceId,
     },
   };
+}
+
+async function installGeminiSkill(projectRoot: string): Promise<boolean> {
+  const skillPath = path.join(projectRoot, "skills", "publer-social-manager.skill");
+  if (!fs.existsSync(skillPath)) {
+    // If not in a subfolder, check root or temp
+    const altPath = path.join(projectRoot, "publer-social-manager.skill");
+    if (!fs.existsSync(altPath)) return false;
+  }
+  
+  try {
+    execSync(`gemini skills install "${skillPath}" --scope user`, { stdio: "inherit" });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function installClaudeCode(entry: McpEntry): string {
@@ -201,7 +240,7 @@ async function validateWorkspaceId(token: string, workspaceId: string): Promise<
 
 // ── Main wizard ───────────────────────────────────────────────────────────────
 
-const TOTAL_STEPS = 5;
+const TOTAL_STEPS = 6;
 const SERVER_JS_PATH = new URL(import.meta.url).pathname;
 const BUILT_SERVER = SERVER_JS_PATH
   .replace("/src/setup.js", "/dist/index.js")
@@ -211,82 +250,94 @@ async function main() {
   banner();
 
   const rl = createInterface({ input, output });
+  const existing = findExistingCredentials();
+
+  let token = existing.token || "";
+  let workspaceId = existing.workspaceId || "";
 
   // ── Step 1 — API token ──────────────────────────────────────────────────────
   step(1, TOTAL_STEPS, "Publer API Token");
-  console.log(`
+
+  if (existing.token) {
+    info(`Detected existing credentials for workspace ${bold(workspaceId)}`);
+    console.log(`  ${cyan("[1]")} Keep existing credentials`);
+    console.log(`  ${cyan("[2]")} Rotate / enter new API token`);
+    console.log();
+    const choice = (await rl.question("  Choice [1]: ")).trim() || "1";
+    if (choice !== "1") {
+      token = "";
+      workspaceId = "";
+    }
+  }
+
+  if (!token) {
+    console.log(`
   To get your token:
-  ${cyan("1.")} Open ${bold("https://app.publer.io")} and log in
+  ${cyan("1.")} Open ${bold("https://publer.com/paweltkaczyk")} and log in
   ${cyan("2.")} Go to ${bold("Profile → Settings → API")}
   ${cyan("3.")} Click ${bold('"Generate Token"')} and copy it
 `);
 
-  let token = "";
-  while (!token) {
-    token = (await rl.question("  Paste your Publer API token: ")).trim();
-    if (!token) { warn("Token cannot be empty."); continue; }
+    while (!token) {
+      token = (await rl.question("  Paste your Publer API token: ")).trim();
+      if (!token) { warn("Token cannot be empty."); continue; }
 
-    info("Validating token against Publer API…");
-    const valid = await validateToken(token);
-    if (valid) {
-      ok("Token accepted!");
-    } else {
-      fail("Token was rejected (401 Unauthorized).");
-      warn("Double-check you copied the full token.");
-      const retry = await rl.question("  Try again? [Y/n] ");
-      if (retry.toLowerCase() === "n") { fail("Aborting setup."); process.exit(1); }
-      token = "";
+      info("Validating token against Publer API…");
+      const valid = await validateToken(token);
+      if (valid) {
+        ok("Token accepted!");
+      } else {
+        fail("Token was rejected (401 Unauthorized).");
+        warn("Double-check you copied the full token.");
+        const retry = await rl.question("  Try again? [Y/n] ");
+        if (retry.toLowerCase() === "n") { fail("Aborting setup."); process.exit(1); }
+        token = "";
+      }
     }
+  } else {
+    ok("Using existing token.");
   }
 
   // ── Step 2 — Workspace ID ───────────────────────────────────────────────────
   step(2, TOTAL_STEPS, "Publer Workspace ID");
 
-  // Try to fetch workspaces and present them to the user
-  info("Fetching your workspaces…");
-  const workspaces = await fetchWorkspaces(token);
-  let workspaceId = "";
+  if (!workspaceId) {
+    // Try to fetch workspaces and present them to the user
+    info("Fetching your workspaces…");
+    const workspaces = await fetchWorkspaces(token);
 
-  if (workspaces.length > 0) {
-    console.log(`\n  ${bold("Your workspaces:")}`);
-    workspaces.forEach((ws, i) => {
-      console.log(`  ${cyan(`[${i + 1}]`)} ${bold(ws.name.padEnd(30))} ${dim(ws.id)}`);
-    });
-    console.log();
+    if (workspaces.length > 0) {
+      console.log(`\n  ${bold("Your workspaces:")}`);
+      workspaces.forEach((ws, i) => {
+        console.log(`  ${cyan(`[${i + 1}]`)} ${bold(ws.name.padEnd(30))} ${dim(ws.id)}`);
+      });
+      console.log();
 
-    const pick = (await rl.question(`  Enter a number to select, or paste a Workspace ID directly: `)).trim();
-    const n = parseInt(pick, 10);
+      const pick = (await rl.question(`  Enter a number to select, or paste a Workspace ID directly: `)).trim();
+      const n = parseInt(pick, 10);
 
-    if (!isNaN(n) && n >= 1 && n <= workspaces.length) {
-      workspaceId = workspaces[n - 1].id;
-      ok(`Selected workspace: ${bold(workspaces[n - 1].name)} (${workspaceId})`);
+      if (!isNaN(n) && n >= 1 && n <= workspaces.length) {
+        workspaceId = workspaces[n - 1].id;
+        ok(`Selected workspace: ${bold(workspaces[n - 1].name)} (${workspaceId})`);
+      } else {
+        workspaceId = pick;
+      }
     } else {
-      workspaceId = pick;
-    }
-  } else {
-    console.log(`
+      console.log(`
   To find your Workspace ID:
   ${cyan("1.")} Look at your Publer URL: ${bold("app.publer.io/workspaces/{id}/...")}
   ${cyan("2.")} Or check Settings → Workspace → General
 `);
-    workspaceId = (await rl.question("  Paste your Workspace ID: ")).trim();
+      workspaceId = (await rl.question("  Paste your Workspace ID: ")).trim();
+    }
+  } else {
+    ok(`Using existing workspace ID: ${bold(workspaceId)}`);
   }
 
   if (!workspaceId) {
     fail("Workspace ID cannot be empty. Aborting.");
     rl.close();
     process.exit(1);
-  }
-
-  // Validate workspace ID if not already confirmed by selection
-  if (workspaces.length === 0 || !workspaces.find((ws) => ws.id === workspaceId)) {
-    info("Validating Workspace ID…");
-    const valid = await validateWorkspaceId(token, workspaceId);
-    if (valid) {
-      ok("Workspace ID accepted!");
-    } else {
-      warn("Could not validate Workspace ID (got 401/403). Continuing anyway — double-check the value.");
-    }
   }
 
   // ── Step 3 — Build the server ───────────────────────────────────────────────
@@ -334,14 +385,23 @@ async function main() {
     else if (n >= 1 && n <= 4) picks.add(agents[n - 1].id);
   });
 
-  if (picks.size === 0) {
-    warn("No agents selected — you can re-run setup at any time.");
-    rl.close();
-    return;
+  // ── Step 5 — Gemini Skill ───────────────────────────────────────────────────
+  step(5, TOTAL_STEPS, "Install Gemini CLI Skill");
+  
+  const installSkill = await rl.question("  Would you like to install the Publer Social Manager skill for Gemini CLI? [Y/n] ");
+  if (installSkill.toLowerCase() !== "n") {
+    info("Installing skill…");
+    const success = await installGeminiSkill(projectRoot);
+    if (success) {
+      ok("Skill installed to Gemini CLI (user scope).");
+      info("Remember to run `/skills reload` in your Gemini CLI session.");
+    } else {
+      warn("Could not find .skill file in project root. Skipping.");
+    }
   }
 
-  // ── Step 5 — Write configs ──────────────────────────────────────────────────
-  step(5, TOTAL_STEPS, "Writing agent configuration");
+  // ── Step 6 — Write configs ──────────────────────────────────────────────────
+  step(6, TOTAL_STEPS, "Writing agent configuration");
   const entry = buildEntry(BUILT_SERVER, token, workspaceId);
 
   const installed: Array<{ label: string; path: string }> = [];
@@ -394,12 +454,12 @@ ${cyan("═".repeat(52))}
     ["list_workspaces",        "List all workspaces"],
     ["list_accounts",          "List connected social accounts"],
     ["list_posts",             "List/filter posts"],
-    ["schedule_post",          "Schedule a post (async → job_id)"],
-    ["publish_post_now",       "Publish immediately (async → job_id)"],
+    ["schedule_post",          "Schedule a post (with threading support)"],
+    ["publish_post_now",       "Publish now (with threading support)"],
     ["delete_post",            "Delete a post"],
     ["get_job_status",         "Poll an async job"],
     ["list_media",             "List media library assets"],
-    ["upload_media_from_url",  "Upload media from URL (async → job_id)"],
+    ["upload_media_from_url",  "Upload media from URL"],
     ["upload_media_file",      "Upload a local file"],
   ].forEach(([name, desc]) => {
     console.log(`    ${magenta("·")} ${bold(name!.padEnd(26))} ${dim(desc!)}`);
