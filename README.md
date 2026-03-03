@@ -60,18 +60,36 @@ Then add the following snippet to each agent's config file, replacing the values
 
 | Tool | Description |
 |------|-------------|
-| `list_workspaces` | List all workspaces |
-| `list_accounts` | List connected social media accounts |
-| `create_post` | Create / schedule a post (supports text, media, links, hashtags) |
-| `list_posts` | List posts filtered by status and/or account |
-| `get_post` | Get full details of a post by ID |
-| `delete_post` | Delete a post |
-| `get_analytics` | Fetch analytics for an account or post |
+| `get_current_user` | Get the profile of the currently authenticated Publer user |
+| `list_workspaces` | List all Publer workspaces the API token has access to |
+| `list_accounts` | List all connected social media accounts in the current workspace |
+| `list_posts` | List posts with optional filters (state, date range, etc.) |
+| `get_post` | Retrieve a specific post by ID |
+| `update_post` | Update an existing post's text, schedule, or media |
+| `schedule_post` | Create a scheduled, draft, or recurring post across accounts |
+| `publish_post_now` | Publish a post immediately across one or more accounts |
+| `delete_post` | Delete a post by ID |
+| `get_post_insights` | Get performance metrics for published posts |
+| `get_best_times` | Get optimal posting times based on audience activity |
+| `list_media` | List media assets in the workspace library |
+| `upload_media_file` | Upload a local file to the media library |
+| `upload_media_from_url`| Upload media from a public URL |
+| `get_job_status` | Poll the status of an asynchronous job (e.g. post creation) |
+| `get_social_manager_instructions` | Get high-level skill instructions and workflows |
+| `split_content_into_thread` | Intelligently split long text for threads |
+| `validate_post` | Check a post against platform constraints |
+| `manage_account_presets` | List, create, or delete groups of accounts |
+| `schedule_posts_bulk` | Schedule multiple posts in a single request |
+| `cleanup_media` | Bulk delete media assets from the library |
 
 ### Advanced Features
 
+- **Account Presets**: You can group multiple social media account IDs into a single label (e.g., `@product`). Once created via `manage_account_presets`, you can use `@label` in any `account_ids` field.
 - **Follow-up Comments**: Tools like `schedule_post` and `publish_post_now` support a `follow_up_text` parameter. On platforms like X, Threads, and Mastodon, this automatically creates a **thread**. On Facebook and LinkedIn, it adds a **comment**.
-- **Social Manager Skill**: This repository includes a specialized agent skill that handles platform-specific character limits, intelligent thread splitting, and optimal posting time selection.
+- **Social Manager Skill**: This repository includes specialized agent instructions for handling platform-specific character limits, intelligent thread splitting, and optimal posting time selection.
+    - **Gemini CLI**: Install as a native skill via `npm run setup`.
+    - **Claude Code**: Setup automatically installs these as a native skill to `.claude/skills/publer-social-manager/`.
+    - **All Agents**: Can access instructions by calling the `get_social_manager_instructions` tool.
 
 ## Development
 

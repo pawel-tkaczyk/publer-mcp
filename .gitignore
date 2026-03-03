@@ -5,3 +5,10 @@ dist/
 *.log
 .claude/
 deno.lock
+
+# Tests
+tests/
+
+# Skills
+AI_copywriting.md
+skills/ai-copywriter/

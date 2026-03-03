@@ -122,19 +122,74 @@ function buildEntry(serverPath: string, token: string, workspaceId: string): Mcp
   };
 }
 
-async function installGeminiSkill(projectRoot: string): Promise<boolean> {
-  const skillPath = path.join(projectRoot, "skills", "publer-social-manager.skill");
-  if (!fs.existsSync(skillPath)) {
-    // If not in a subfolder, check root or temp
-    const altPath = path.join(projectRoot, "publer-social-manager.skill");
-    if (!fs.existsSync(altPath)) return false;
+async function installGeminiSkills(projectRoot: string): Promise<string[]> {
+  const skillsDir = path.join(projectRoot, "skills");
+  if (!fs.existsSync(skillsDir)) return [];
+
+  const installed: string[] = [];
+  const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    let skillPath = "";
+    if (entry.isFile() && entry.name.endsWith(".skill")) {
+      skillPath = path.join(skillsDir, entry.name);
+    } else if (entry.isDirectory()) {
+      const potentialSkillMd = path.join(skillsDir, entry.name, "SKILL.md");
+      if (fs.existsSync(potentialSkillMd)) {
+        skillPath = path.join(skillsDir, entry.name);
+      }
+    }
+
+    if (skillPath) {
+      try {
+        execSync(`gemini skills install "${skillPath}" --scope user`, { stdio: "inherit" });
+        installed.push(entry.name.replace(".skill", ""));
+      } catch (err) {
+        console.error(red(`  Failed to install Gemini skill ${entry.name}`));
+      }
+    }
   }
-  
-  try {
-    execSync(`gemini skills install "${skillPath}" --scope user`, { stdio: "inherit" });
-    return true;
-  } catch {
-    return false;
+  return installed;
+}
+
+async function installClaudeCodeSkills(projectRoot: string): Promise<string[]> {
+  const skillsDir = path.join(projectRoot, "skills");
+  const targetRoot = path.join(projectRoot, ".claude", "skills");
+  if (!fs.existsSync(skillsDir)) return [];
+
+  const installed: string[] = [];
+  const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      const srcDir = path.join(skillsDir, entry.name);
+      const skillMd = path.join(srcDir, "SKILL.md");
+      if (fs.existsSync(skillMd)) {
+        const destDir = path.join(targetRoot, entry.name);
+        try {
+          fs.mkdirSync(destDir, { recursive: true });
+          copyRecursiveSync(srcDir, destDir);
+          installed.push(entry.name);
+        } catch (err) {
+          console.error(red(`  Failed to install Claude Code skill ${entry.name}`));
+        }
+      }
+    }
+  }
+  return installed;
+}
+
+function copyRecursiveSync(src: string, dest: string) {
+  const exists = fs.existsSync(src);
+  const stats = exists && fs.statSync(src);
+  const isDirectory = exists && stats && stats.isDirectory();
+  if (isDirectory) {
+    if (!fs.existsSync(dest)) fs.mkdirSync(dest);
+    fs.readdirSync(src).forEach((child) => {
+      copyRecursiveSync(path.join(src, child), path.join(dest, child));
+    });
+  } else {
+    fs.copyFileSync(src, dest);
   }
 }
 
@@ -385,19 +440,15 @@ async function main() {
     else if (n >= 1 && n <= 4) picks.add(agents[n - 1].id);
   });
 
-  // ── Step 5 — Gemini Skill ───────────────────────────────────────────────────
-  step(5, TOTAL_STEPS, "Install Gemini CLI Skill");
+  // ── Step 5 — Skill / Instructions ───────────────────────────────────────────
+  step(5, TOTAL_STEPS, "Install Agent Skills");
   
-  const installSkill = await rl.question("  Would you like to install the Publer Social Manager skill for Gemini CLI? [Y/n] ");
-  if (installSkill.toLowerCase() !== "n") {
-    info("Installing skill…");
-    const success = await installGeminiSkill(projectRoot);
-    if (success) {
-      ok("Skill installed to Gemini CLI (user scope).");
-      info("Remember to run `/skills reload` in your Gemini CLI session.");
-    } else {
-      warn("Could not find .skill file in project root. Skipping.");
-    }
+  let shouldInstallSkill = false;
+  if (picks.size > 0) {
+    const installSkill = await rl.question("  Would you like to install the Publer Agent Skills (Social Manager & AI Copywriter) for the selected agent(s)? [Y/n] ");
+    shouldInstallSkill = installSkill.toLowerCase() !== "n";
+  } else {
+    warn("No agents selected. Skipping skill installation.");
   }
 
   // ── Step 6 — Write configs ──────────────────────────────────────────────────
@@ -407,11 +458,14 @@ async function main() {
   const installed: Array<{ label: string; path: string }> = [];
   const failed: Array<{ label: string; err: string }> = [];
 
-  async function tryInstall(label: string, fn: () => string) {
+  async function tryInstall(label: string, fn: () => string | Promise<string | string[] | null>) {
     try {
-      const p = fn();
-      ok(`${bold(label)} → ${dim(p)}`);
-      installed.push({ label, path: p });
+      const p = await fn();
+      if (p) {
+        const pathStr = Array.isArray(p) ? p.join(", ") : p;
+        ok(`${bold(label)} → ${dim(pathStr)}`);
+        installed.push({ label, path: pathStr });
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       fail(`${bold(label)}: ${msg}`);
@@ -423,6 +477,31 @@ async function main() {
   if (picks.has("claude-desktop")) await tryInstall("Claude Desktop", () => installClaudeDesktop(entry));
   if (picks.has("codex"))          await tryInstall("OpenAI Codex",   () => installCodex(entry));
   if (picks.has("gemini"))         await tryInstall("Gemini CLI",     () => installGemini(entry));
+
+  if (shouldInstallSkill) {
+    console.log(`\n  ${bold("Installing skills:")}`);
+    if (picks.has("gemini")) {
+      await tryInstall("Gemini CLI Skills", async () => {
+        const skills = await installGeminiSkills(projectRoot);
+        if (skills.length > 0) {
+          info("Remember to run `/skills reload` in your Gemini CLI session.");
+          return skills;
+        }
+        throw new Error("No skills found in skills/ directory.");
+      });
+    }
+    if (picks.has("claude-code")) {
+      await tryInstall("Claude Code Skills", async () => {
+        const skills = await installClaudeCodeSkills(projectRoot);
+        if (skills.length > 0) return skills;
+        throw new Error("No skills found in skills/ directory.");
+      });
+    }
+    if (picks.has("claude-desktop") || picks.has("codex")) {
+      info("Note: Claude Desktop and Codex do not support native skills.");
+      info("The instructions are available in the `skills/` directory for manual reference.");
+    }
+  }
 
   // ── Summary ─────────────────────────────────────────────────────────────────
   console.log(`
@@ -448,11 +527,11 @@ ${cyan("═".repeat(52))}
     console.log();
   }
 
-  console.log(bold("  Available MCP tools (11):"));
+  console.log(bold("  Available MCP tools (17):"));
   [
     ["get_current_user",       "Get authenticated user profile"],
     ["list_workspaces",        "List all workspaces"],
-    ["list_accounts",          "List connected social accounts"],
+    ["list_accounts",          "List connected social media accounts"],
     ["list_posts",             "List/filter posts"],
     ["schedule_post",          "Schedule a post (with threading support)"],
     ["publish_post_now",       "Publish now (with threading support)"],
@@ -461,7 +540,14 @@ ${cyan("═".repeat(52))}
     ["list_media",             "List media library assets"],
     ["upload_media_from_url",  "Upload media from URL"],
     ["upload_media_file",      "Upload a local file"],
+    ["get_social_manager_instructions", "Get high-level skill instructions"],
+    ["split_content_into_thread", "Intelligently split text for threads"],
+    ["validate_post",          "Check post against platform limits"],
+    ["manage_account_presets", "Manage @groups of social accounts"],
+    ["schedule_posts_bulk",    "Schedule many posts at once"],
+    ["cleanup_media",          "Bulk delete media assets"],
   ].forEach(([name, desc]) => {
+
     console.log(`    ${magenta("·")} ${bold(name!.padEnd(26))} ${dim(desc!)}`);
   });
 

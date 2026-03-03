@@ -9,10 +9,49 @@ import axios, { AxiosInstance } from "axios";
 import fs from "node:fs";
 import FormData from "form-data";
 import path from "node:path";
+import os from "node:os";
+import { PLATFORMS, normalizePlatform } from "./platforms.js";
 
 const PUBLER_API_BASE = "https://app.publer.com/api/v1";
 
 // ── Client helpers ────────────────────────────────────────────────────────────
+
+const PRESETS_PATH = path.join(os.homedir(), ".publer", "presets.json");
+
+function getPresets(): Record<string, string[]> {
+  try {
+    if (fs.existsSync(PRESETS_PATH)) {
+      return JSON.parse(fs.readFileSync(PRESETS_PATH, "utf-8"));
+    }
+  } catch {}
+  return {};
+}
+
+function savePresets(presets: Record<string, string[]>) {
+  const dir = path.dirname(PRESETS_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(PRESETS_PATH, JSON.stringify(presets, null, 2), "utf-8");
+}
+
+function resolveAccountIds(ids: string[]): string[] {
+  const presets = getPresets();
+  const resolved = new Set<string>();
+  
+  for (const id of ids) {
+    if (id.startsWith("@")) {
+      const name = id.substring(1);
+      const presetIds = presets[name];
+      if (presetIds) {
+        presetIds.forEach(pid => resolved.add(pid));
+      } else {
+        resolved.add(id); // Keep as is if preset not found
+      }
+    } else {
+      resolved.add(id);
+    }
+  }
+  return Array.from(resolved);
+}
 
 /** Client for endpoints that require the Publer-Workspace-Id header */
 function getClient(): AxiosInstance {
@@ -72,7 +111,8 @@ function buildScheduleBody(
   args: Record<string, unknown>,
   includeScheduledAt: boolean
 ): Record<string, unknown> {
-  const accountIds = args.account_ids as string[];
+  const rawAccountIds = args.account_ids as string[];
+  const accountIds = resolveAccountIds(rawAccountIds);
   const accounts = accountIds.map((id) => {
     const entry: Record<string, unknown> = { id };
     if (includeScheduledAt && args.scheduled_at) {
@@ -475,6 +515,113 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+
+    {
+      name: "get_social_manager_instructions",
+      description:
+        "Get high-level instructions and best practices for managing social media with Publer. " +
+        "Use this to understand how to handle multi-platform campaigns, threading, and optimal scheduling.",
+      inputSchema: { type: "object", properties: {} },
+    },
+
+    {
+      name: "split_content_into_thread",
+      description: "Intelligently split long text into a series of posts (a thread) for a specific platform.",
+      inputSchema: {
+        type: "object",
+        required: ["text", "platform"],
+        properties: {
+          text: { type: "string", description: "The long content to split" },
+          platform: {
+            type: "string",
+            description: "Target platform (twitter, mastodon, threads, etc.)",
+          },
+          includeNumbering: {
+            type: "boolean",
+            description: "Whether to add (1/n) numbering to posts",
+            default: true,
+          },
+        },
+      },
+    },
+
+    {
+      name: "validate_post",
+      description: "Perform a 'sanity check' on a post's content and media against platform-specific constraints.",
+      inputSchema: {
+        type: "object",
+        required: ["text", "platform"],
+        properties: {
+          text: { type: "string", description: "The post caption" },
+          platform: { type: "string", description: "Target platform" },
+          media_count: { type: "number", description: "Number of media items attached" },
+          media_types: {
+            type: "array",
+            items: { type: "string" },
+            description: "Types of media (photo, video, gif)",
+          },
+        },
+      },
+    },
+
+    {
+      name: "manage_account_presets",
+      description: "List, create, or delete reusable groups of social media accounts.",
+      inputSchema: {
+        type: "object",
+        required: ["action"],
+        properties: {
+          action: { type: "string", enum: ["list", "create", "delete"] },
+          name: { type: "string", description: "Preset name (e.g. 'work')" },
+          account_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "Account IDs to include in the preset",
+          },
+        },
+      },
+    },
+
+    {
+      name: "schedule_posts_bulk",
+      description: "Schedule multiple posts in a single request using Publer's bulk API.",
+      inputSchema: {
+        type: "object",
+        required: ["posts"],
+        properties: {
+          posts: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["account_ids", "text"],
+              properties: {
+                account_ids: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Account IDs (supports @presets)",
+                },
+                text: { type: "string" },
+                scheduled_at: { type: "string" },
+                media_ids: { type: "array", items: { type: "string" } },
+                state: { type: "string" },
+              },
+            },
+          },
+        },
+      },
+    },
+
+    {
+      name: "cleanup_media",
+      description: "Bulk delete specified media assets from the library.",
+      inputSchema: {
+        type: "object",
+        required: ["media_ids"],
+        properties: {
+          media_ids: { type: "array", items: { type: "string" } },
+        },
+      },
+    },
   ],
 }));
 
@@ -485,6 +632,192 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
+      // ... (rest of cases)
+      case "manage_account_presets": {
+        const action = args!.action as "list" | "create" | "delete";
+        const presets = getPresets();
+
+        if (action === "list") {
+          return { content: [{ type: "text", text: JSON.stringify(presets, null, 2) }] };
+        }
+
+        const name = args!.name as string;
+        if (!name) throw new Error("Preset name is required for create/delete.");
+
+        if (action === "create") {
+          const ids = args!.account_ids as string[];
+          if (!ids || !ids.length) throw new Error("Account IDs are required for create.");
+          presets[name] = ids;
+          savePresets(presets);
+          return { content: [{ type: "text", text: `Preset '@${name}' created with ${ids.length} accounts.` }] };
+        }
+
+        if (action === "delete") {
+          delete presets[name];
+          savePresets(presets);
+          return { content: [{ type: "text", text: `Preset '@${name}' deleted.` }] };
+        }
+        throw new Error("Invalid action.");
+      }
+
+      case "schedule_posts_bulk": {
+        const posts = args!.posts as Array<Record<string, unknown>>;
+        const bulkPosts = posts.map(p => {
+          const accountIds = resolveAccountIds(p.account_ids as string[]);
+          const networks = buildNetworks(p.text as string, p.media_ids as string[] | undefined);
+          const accounts = accountIds.map(id => {
+            const entry: Record<string, unknown> = { id };
+            if (p.scheduled_at) entry.scheduled_at = p.scheduled_at;
+            return entry;
+          });
+          return { networks, accounts };
+        });
+
+        const res = await getClient().post("/posts/schedule", {
+          bulk: {
+            state: (args!.state as string) ?? "scheduled",
+            posts: bulkPosts,
+          }
+        });
+        return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
+      }
+
+      case "cleanup_media": {
+        const mediaIds = args!.media_ids as string[];
+        await getClient().delete("/media", { params: { "media_ids[]": mediaIds } });
+        return { content: [{ type: "text", text: `Successfully deleted ${mediaIds.length} media items.` }] };
+      }
+
+      case "split_content_into_thread": {
+        const text = args!.text as string;
+        const platformKey = normalizePlatform(args!.platform as string);
+        const config = PLATFORMS[platformKey] ?? PLATFORMS.twitter;
+        const includeNumbering = args!.includeNumbering !== false;
+
+        const limit = config.charLimit - (includeNumbering ? 8 : 0);
+        const parts: string[] = [];
+        
+        // Simple but effective paragraph/sentence aware splitter
+        let current = "";
+        const paragraphs = text.split("\n\n");
+        
+        for (const para of paragraphs) {
+          if ((current + para).length <= limit) {
+            current += (current ? "\n\n" : "") + para;
+          } else {
+            if (current) parts.push(current.trim());
+            
+            // If a single paragraph is too long, split by sentence
+            if (para.length > limit) {
+              const sentences = para.match(/[^.!?]+[.!?]+/g) || [para];
+              current = "";
+              for (const sentence of sentences) {
+                if ((current + sentence).length <= limit) {
+                  current += (current ? " " : "") + sentence;
+                } else {
+                  if (current) parts.push(current.trim());
+                  current = sentence;
+                  // If a single sentence is still too long, hard split (rare)
+                  while (current.length > limit) {
+                    parts.push(current.substring(0, limit).trim());
+                    current = current.substring(limit);
+                  }
+                }
+              }
+            } else {
+              current = para;
+            }
+          }
+        }
+        if (current) parts.push(current.trim());
+
+        const numberedParts = includeNumbering 
+          ? parts.map((p, i) => `${p} (${i + 1}/${parts.length})`)
+          : parts;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                platform: config.name,
+                partCount: parts.length,
+                parts: numberedParts,
+              }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "validate_post": {
+        const text = args!.text as string;
+        const platformKey = normalizePlatform(args!.platform as string);
+        const config = PLATFORMS[platformKey];
+        
+        if (!config) {
+          return {
+            content: [{ type: "text", text: `Unknown platform: ${args!.platform}` }],
+            isError: true,
+          };
+        }
+
+        const errors: string[] = [];
+        if (text.length > config.charLimit) {
+          errors.push(`Text exceeds limit: ${text.length}/${config.charLimit} chars.`);
+        }
+
+        const mediaCount = (args!.media_count as number) || 0;
+        if (mediaCount > config.mediaLimit) {
+          errors.push(`Media count exceeds limit: ${mediaCount}/${config.mediaLimit} items.`);
+        }
+
+        const mediaTypes = (args!.media_types as string[]) || [];
+        for (const type of mediaTypes) {
+          if (!config.supportedMediaTypes.includes(type)) {
+            errors.push(`${config.name} does not support media type: ${type}`);
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                valid: errors.length === 0,
+                platform: config.name,
+                errors: errors.length > 0 ? errors : undefined,
+              }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "get_social_manager_instructions": {
+        const projectRoot = path.resolve(new URL(import.meta.url).pathname, "..", "..");
+        const skillsDir = path.join(projectRoot, "skills");
+        let combinedContent = "";
+
+        if (fs.existsSync(skillsDir)) {
+          const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.isDirectory()) {
+              const skillMdPath = path.join(skillsDir, entry.name, "SKILL.md");
+              if (fs.existsSync(skillMdPath)) {
+                const content = fs.readFileSync(skillMdPath, "utf-8");
+                combinedContent += `\n--- SKILL: ${entry.name} ---\n${content}\n`;
+              }
+            }
+          }
+        }
+
+        if (!combinedContent) {
+          combinedContent = "High-level workflows for Publer Social Manager:\n" +
+            "1. Multi-platform adaptation: Use platform character limits.\n" +
+            "2. Threads: Use follow_up_text for comments/threads.\n" +
+            "3. Smart timing: Use get_best_times before scheduling.";
+        }
+        return { content: [{ type: "text", text: combinedContent }] };
+      }
       // ── Users ────────────────────────────────────────────────────────────
       case "get_current_user": {
         const res = await getBaseClient().get("/users/me");
