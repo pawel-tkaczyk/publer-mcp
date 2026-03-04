@@ -12,22 +12,22 @@ This skill provides high-level workflows for multi-platform social media managem
 
 ### 1. Multi-Platform Campaign Planning
 When asked to post across different networks:
-1.  **Draft content**: Create platform-specific versions based on [platform_limits.md](references/platform_limits.md).
-2.  **Adapt**: Automatically shorten for X/Threads/Mastodon or expand for LinkedIn.
-3.  **Propose**: Present all versions for user approval before scheduling.
+1.  **Discovery**: Use `get_platform_info` to quickly see all connected accounts and their specific limits.
+2.  **Adaptation**: Use `auto_adapt: true` in `schedule_post` or `publish_post_now` to automatically handle character limits and threading for X, Threads, and Mastodon.
+3.  **Propose**: Present the versions to the user (use `split_content_into_thread` if you need to show them the exact split beforehand).
 
-### 2. Thread Creation & Follow-up
-For long-form content or when a follow-up is needed:
--   **Threads**: Propose splitting text into a numbered thread for X, Threads, or Mastodon.
--   **Follow-up**: Use `follow_up_text` in `schedule_post` for "Link in bio" comments or to start a discussion.
+### 2. Streamlined Media Publishing
+For posts with media from URLs:
+-   **One-Step**: Use `publish_with_media` to upload and publish/schedule in a single call. This tool handles the background upload and polling automatically.
+-   **Local Media**: Use `upload_media_file` for local files to get a `media_id` before calling `schedule_post`.
 
-### 3. Smart Scheduling
--   **Optimal Time**: If the user is vague (e.g., "post tomorrow"), first use `get_best_times` for the selected account(s) to pick the perfect slot.
--   **Conflict Resolution**: Use `list_posts` to ensure no overlapping content is scheduled.
+### 3. Thread Creation & Follow-up
+-   **Auto-Threading**: Set `auto_adapt: true` to let the server handle splitting long content into numbered threads.
+-   **Manual Follow-up**: Use `follow_up_text` in `schedule_post` for a specific "Link in bio" comment or to start a discussion.
 
-### 4. Media Handling
--   **Upload first**: If local media is provided, use `upload_media_file` to get a `media_id` before calling `schedule_post`.
--   **URLs**: For web-based media, use `upload_media_from_url`.
+### 4. Smart Scheduling
+-   **Optimal Time**: Use `get_best_times` to pick the perfect slot based on audience activity.
+-   **Semantic Filtering**: Use `list_accounts(capability: 'video')` or `list_accounts(provider: 'twitter')` to quickly find relevant accounts without scanning a large list.
 
 ## Usage Examples
 

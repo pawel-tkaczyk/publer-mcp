@@ -94,54 +94,207 @@ function getBaseClient(): AxiosInstance {
   });
 }
 
+// ── Error handling ────────────────────────────────────────────────────────────
+
+function wrapError(err: unknown): { content: { type: "text"; text: string }[]; isError: true; remedy?: string } {
+  let message = "Unknown error occurred.";
+  let remedy = "Check the logs or try a different approach.";
+
+  if (axios.isAxiosError(err)) {
+    const status = err.response?.status;
+    const data = err.response?.data as any;
+    message = `Publer API error ${status}: ${JSON.stringify(data || err.message)}`;
+
+    switch (status) {
+      case 401:
+        remedy = "Your API token is invalid or expired. Run `npm run setup` to refresh it.";
+        break;
+      case 403:
+        remedy = "You don't have permission for this workspace. Check your PUBLER_WORKSPACE_ID in .env or run setup.";
+        break;
+      case 404:
+        remedy = "The requested resource (post, account, or media) was not found. Verify the ID you provided.";
+        break;
+      case 413:
+        remedy = "The file is too large (Publer limit is usually 200MB). Try a smaller version or a different format.";
+        break;
+      case 422:
+        remedy = "Validation failed. " + (data?.message || "Check your post content and platform-specific limits.");
+        break;
+      case 429:
+        remedy = "You've hit Publer's rate limit. Wait a minute and try again.";
+        break;
+      default:
+        if (status && status >= 500) {
+          remedy = "Publer servers are having trouble. Wait a few minutes and retry.";
+        }
+    }
+  } else if (err instanceof Error) {
+    message = err.message;
+    if (message.includes("PUBLER_API_TOKEN")) {
+      remedy = "Run `npm run setup` to configure your API credentials.";
+    }
+  }
+
+  return {
+    content: [{ type: "text", text: `Error: ${message}` }],
+    isError: true,
+    remedy,
+  };
+}
+
 // ── Post body builder ─────────────────────────────────────────────────────────
 
 type MediaRef = { id: string };
 
-function buildNetworks(
-  text: string,
-  mediaIds?: string[]
-): Record<string, unknown> {
-  const media: MediaRef[] = mediaIds?.map((id) => ({ id })) ?? [];
-  // "global" applies the same content to all target platforms
-  return { global: { text, media } };
+function splitForPlatform(text: string, provider: string): string[] {
+  const platformKey = normalizePlatform(provider);
+  const config = PLATFORMS[platformKey] ?? PLATFORMS.twitter;
+  
+  if (text.length <= config.charLimit) return [text];
+  if (!config.supportsThreading) {
+    return [text.substring(0, config.charLimit - 3) + "..."];
+  }
+
+  const limit = config.charLimit - 8;
+  const parts: string[] = [];
+  let current = "";
+  const paragraphs = text.split("\n\n");
+  
+  for (const para of paragraphs) {
+    if ((current + para).length <= limit) {
+      current += (current ? "\n\n" : "") + para;
+    } else {
+      if (current) parts.push(current.trim());
+      if (para.length > limit) {
+        const sentences = para.match(/[^.!?]+[.!?]+/g) || [para];
+        current = "";
+        for (const sentence of sentences) {
+          if ((current + sentence).length <= limit) {
+            current += (current ? " " : "") + sentence;
+          } else {
+            if (current) parts.push(current.trim());
+            current = sentence;
+            while (current.length > limit) {
+              parts.push(current.substring(0, limit).trim());
+              current = current.substring(limit);
+            }
+          }
+        }
+      } else {
+        current = para;
+      }
+    }
+  }
+  if (current) parts.push(current.trim());
+  return parts.map((p, i) => `${p} (${i + 1}/${parts.length})`);
 }
 
-function buildScheduleBody(
+async function enrichNetworks(
+  text: string,
+  mediaIds: string[] | undefined,
+  accountIds: string[],
+  client: AxiosInstance,
+  autoAdapt: boolean = false
+): Promise<Record<string, any>> {
+  const networks: Record<string, any> = {};
+  const media = mediaIds?.map(id => ({ id })) ?? [];
+  
+  try {
+    const res = await client.get("/accounts");
+    const allAccounts = res.data as Array<{ id: string; provider: string }>;
+    
+    const targetProviders = new Set<string>();
+    for (const id of accountIds) {
+      const acc = allAccounts.find(a => a.id === id);
+      if (acc) targetProviders.add(acc.provider);
+    }
+
+    for (const provider of targetProviders) {
+      const config: Record<string, any> = {
+        text,
+        media
+      };
+
+      if (autoAdapt) {
+        const parts = splitForPlatform(text, provider);
+        config.text = parts[0];
+        if (parts.length > 1) {
+          (config as any)._parts = parts;
+        }
+      }
+
+      // Set type
+      if (["facebook", "mastodon", "bluesky", "threads", "telegram"].includes(provider)) {
+        config.type = "status";
+      } else if (provider === "instagram") {
+        config.type = "post";
+      } else if (provider === "linkedin") {
+        config.type = "status";
+      } else if (provider === "pinterest") {
+        config.type = "pin";
+      } else if (["youtube", "tiktok"].includes(provider)) {
+        config.type = "video";
+      } else {
+        config.type = "status";
+      }
+      networks[provider] = config;
+    }
+  } catch (err) {
+    networks.global = { text, media };
+  }
+
+  return networks;
+}
+
+async function buildScheduleBody(
   args: Record<string, unknown>,
-  includeScheduledAt: boolean
-): Record<string, unknown> {
+  includeScheduledAt: boolean,
+  client: AxiosInstance
+): Promise<Record<string, unknown>> {
   const rawAccountIds = args.account_ids as string[];
   const accountIds = resolveAccountIds(rawAccountIds);
-  const accounts = accountIds.map((id) => {
-    const entry: Record<string, unknown> = { id };
+  const text = args.text as string;
+  const mediaIds = args.media_ids as string[] | undefined;
+  const autoAdapt = !!args.auto_adapt;
+  
+  const networks = args.networks
+    ? (args.networks as Record<string, unknown>)
+    : await enrichNetworks(text, mediaIds, accountIds, client, autoAdapt);
+
+  const accounts = accountIds.map(id => {
+    const entry: Record<string, any> = { id };
     if (includeScheduledAt && args.scheduled_at) {
       entry.scheduled_at = args.scheduled_at;
     }
-
-    if (args.follow_up_text) {
-      entry.comments = [
-        {
-          text: args.follow_up_text as string,
-          conditions: {
-            relation: "AND",
-            clauses: {
-              age: { duration: 1, unit: "Minute" },
-            },
-          },
-        },
-      ];
-    }
-
     return entry;
   });
 
-  const networks =
-    args.networks ??
-    buildNetworks(
-      args.text as string,
-      args.media_ids as string[] | undefined
-    );
+  if (autoAdapt) {
+    try {
+      const res = await client.get("/accounts");
+      const allAccounts = res.data as Array<{ id: string; provider: string }>;
+      
+      for (const accEntry of accounts) {
+        const accInfo = allAccounts.find(a => a.id === accEntry.id);
+        if (accInfo) {
+          const netConfig = networks[accInfo.provider];
+          if (netConfig && netConfig._parts && netConfig._parts.length > 1) {
+            const [_first, ...rest] = netConfig._parts;
+            accEntry.comments = rest.map((t: string, i: number) => ({
+              text: t,
+              conditions: { 
+                relation: "AND", 
+                clauses: { age: { duration: i + 1, unit: "Minute" } } 
+              }
+            }));
+          }
+        }
+      }
+    } catch {}
+  }
+
+  Object.values(networks).forEach(v => { if (v && typeof v === 'object') delete (v as any)._parts; });
 
   return {
     bulk: {
@@ -151,695 +304,367 @@ function buildScheduleBody(
   };
 }
 
+async function pollJob(client: AxiosInstance, jobId: string, maxAttempts = 15): Promise<any> {
+  for (let i = 0; i < maxAttempts; i++) {
+    const res = await client.get(`/job_status/${jobId}`);
+    const data = res.data;
+    if (data.status !== null) return data;
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+  throw new Error("Job polling timed out.");
+}
+
 // ── MCP server ────────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "publer-mcp", version: "2.0.0" },
+  { name: "publer-mcp", version: "2.1.0" },
   { capabilities: { tools: {} } }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
-    // ── Users ──────────────────────────────────────────────────────────────
     {
       name: "get_current_user",
       description: "Get the profile of the currently authenticated Publer user",
       inputSchema: { type: "object", properties: {} },
     },
-
-    // ── Workspaces ─────────────────────────────────────────────────────────
     {
       name: "list_workspaces",
       description: "List all Publer workspaces the API token has access to",
       inputSchema: { type: "object", properties: {} },
     },
-
-    // ── Accounts ───────────────────────────────────────────────────────────
     {
       name: "list_accounts",
-      description:
-        "List all connected social media accounts in the current workspace",
+      description: "List all connected social media accounts in the current workspace",
+      inputSchema: {
+        type: "object",
+        properties: {
+          provider: { type: "string", description: "Filter by provider (e.g. facebook, twitter)" },
+          capability: {
+            type: "string",
+            enum: ["threading", "video", "photo"],
+            description: "Filter by platform capability",
+          },
+        },
+      },
+    },
+    {
+      name: "get_platform_info",
+      description: "Get combined information about all connected platforms and their limits",
       inputSchema: { type: "object", properties: {} },
     },
-
-    // ── Posts ──────────────────────────────────────────────────────────────
     {
       name: "list_posts",
       description: "List posts with optional filters",
       inputSchema: {
         type: "object",
         properties: {
-          state: {
-            type: "string",
-            enum: ["scheduled", "published", "failed", "draft", "draft_private", "draft_public", "recurring"],
-            description: "Filter by a single post state",
-          },
-          states: {
-            type: "array",
-            items: { type: "string" },
-            description: "Filter by multiple post states",
-          },
-          from: {
-            type: "string",
-            description: "Include posts on/after this ISO 8601 date or datetime",
-          },
-          to: {
-            type: "string",
-            description: "Include posts on/before this ISO 8601 date or datetime",
-          },
-          account_ids: {
-            type: "array",
-            items: { type: "string" },
-            description: "Filter by specific account IDs",
-          },
-          query: {
-            type: "string",
-            description: "Full-text search keyword in post content",
-          },
-          postType: {
-            type: "string",
-            description: "Filter by content type (photo, video, reel, story, etc.)",
-          },
-          member_id: {
-            type: "string",
-            description: "Filter posts by the workspace member who created them",
-          },
-          page: {
-            type: "number",
-            description: "Page number for pagination (0-based, default 0)",
-          },
+          state: { type: "string", enum: ["scheduled", "published", "failed", "draft", "draft_private", "draft_public", "recurring"] },
+          states: { type: "array", items: { type: "string" } },
+          from: { type: "string" },
+          to: { type: "string" },
+          account_ids: { type: "array", items: { type: "string" } },
+          query: { type: "string" },
+          postType: { type: "string" },
+          member_id: { type: "string" },
+          page: { type: "number" },
         },
       },
     },
-
     {
       name: "get_post",
       description: "Retrieve a specific post by ID",
       inputSchema: {
         type: "object",
         required: ["post_id"],
-        properties: {
-          post_id: { type: "string", description: "The ID of the post to retrieve" },
-        },
+        properties: { post_id: { type: "string" } },
       },
     },
-
     {
       name: "update_post",
-      description: "Update an existing post. Returns a job_id (poll get_job_status).",
+      description: "Update an existing post",
       inputSchema: {
         type: "object",
         required: ["post_id"],
         properties: {
-          post_id: { type: "string", description: "The ID of the post to update" },
-          text: { type: "string", description: "Updated post caption" },
-          scheduled_at: { type: "string", description: "Updated ISO 8601 datetime" },
-          account_ids: {
-            type: "array",
-            items: { type: "string" },
-            description: "Account IDs to target",
-          },
-          label_ids: {
-            type: "array",
-            items: { type: "string" },
-            description: "IDs of labels to assign to this post",
-          },
-          media_ids: {
-            type: "array",
-            items: { type: "string" },
-            description: "Updated Media IDs",
-          },
+          post_id: { type: "string" },
+          text: { type: "string" },
+          scheduled_at: { type: "string" },
+          account_ids: { type: "array", items: { type: "string" } },
+          label_ids: { type: "array", items: { type: "string" } },
+          media_ids: { type: "array", items: { type: "string" } },
         },
       },
     },
-
     {
       name: "list_labels",
       description: "List all labels defined in the workspace",
       inputSchema: { type: "object", properties: {} },
     },
-
     {
       name: "get_post_insights",
-      description: "Get detailed performance metrics for published posts",
+      description: "Get detailed performance metrics",
       inputSchema: {
         type: "object",
         required: ["from", "to"],
         properties: {
-          from: { type: "string", description: "Start date (YYYY-MM-DD)" },
-          to: { type: "string", description: "End date (YYYY-MM-DD)" },
-          account_id: { type: "string", description: "Optional: filter by account ID" },
+          from: { type: "string" },
+          to: { type: "string" },
+          account_id: { type: "string" },
         },
       },
     },
-
     {
       name: "get_best_times",
-      description: "Get a heatmap of optimal posting times based on audience activity",
+      description: "Get a heatmap of optimal posting times",
       inputSchema: {
         type: "object",
-        properties: {
-          account_id: { type: "string", description: "Optional: filter by account ID" },
-        },
+        properties: { account_id: { type: "string" } },
       },
     },
-
     {
       name: "schedule_post",
-      description:
-        "Create a scheduled (or draft/recurring) post across one or more accounts. " +
-        "Returns a job_id — poll get_job_status to confirm completion.",
+      description: "Create a scheduled post (supports auto_adapt threading)",
       inputSchema: {
         type: "object",
         required: ["account_ids", "text"],
         properties: {
-          account_ids: {
-            type: "array",
-            items: { type: "string" },
-            description: "Account IDs to post to",
-          },
-          text: {
-            type: "string",
-            description: "Post caption / text (applied to all platforms via 'global' network key)",
-          },
-          scheduled_at: {
-            type: "string",
-            description: "ISO 8601 datetime to publish (omit to use Publer's auto-scheduling)",
-          },
-          state: {
-            type: "string",
-            enum: ["scheduled", "draft", "draft_private", "draft_public", "recurring"],
-            description: "Post state (default: 'scheduled')",
-          },
-          media_ids: {
-            type: "array",
-            items: { type: "string" },
-            description: "Media IDs from upload_media_file or upload_media_from_url",
-          },
-          follow_up_text: {
-            type: "string",
-            description: "An optional follow-up comment to post shortly after the main post.",
-          },
-          networks: {
-            type: "object",
-            description:
-              "Advanced: raw per-platform networks object (overrides text/media_ids). " +
-              "Keys: facebook, instagram, twitter, linkedin, pinterest, youtube, tiktok, " +
-              "google, wordpress_basic, wordpress_oauth, telegram, mastodon, threads, bluesky, global",
-          },
+          account_ids: { type: "array", items: { type: "string" } },
+          text: { type: "string" },
+          auto_adapt: { type: "boolean" },
+          scheduled_at: { type: "string" },
+          state: { type: "string", enum: ["scheduled", "draft", "draft_private", "draft_public", "recurring"] },
+          media_ids: { type: "array", items: { type: "string" } },
+          follow_up_text: { type: "string" },
+          networks: { type: "object" },
         },
       },
     },
-
     {
       name: "publish_post_now",
-      description:
-        "Publish a post immediately across one or more accounts. " +
-        "Returns a job_id — poll get_job_status to confirm completion.",
+      description: "Publish a post immediately (supports auto_adapt threading)",
       inputSchema: {
         type: "object",
         required: ["account_ids", "text"],
         properties: {
-          account_ids: {
-            type: "array",
-            items: { type: "string" },
-            description: "Account IDs to post to",
-          },
-          text: {
-            type: "string",
-            description: "Post caption / text",
-          },
-          media_ids: {
-            type: "array",
-            items: { type: "string" },
-            description: "Media IDs to attach",
-          },
-          follow_up_text: {
-            type: "string",
-            description: "An optional follow-up comment to post shortly after the main post.",
-          },
-          networks: {
-            type: "object",
-            description: "Advanced: raw per-platform networks object",
-          },
+          account_ids: { type: "array", items: { type: "string" } },
+          text: { type: "string" },
+          auto_adapt: { type: "boolean" },
+          media_ids: { type: "array", items: { type: "string" } },
+          follow_up_text: { type: "string" },
+          networks: { type: "object" },
         },
       },
     },
-
+    {
+      name: "publish_with_media",
+      description: "Convenience: Upload media from URLs and publish in one step",
+      inputSchema: {
+        type: "object",
+        required: ["account_ids", "text", "media_urls"],
+        properties: {
+          account_ids: { type: "array", items: { type: "string" } },
+          text: { type: "string" },
+          media_urls: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["url", "name"],
+              properties: {
+                url: { type: "string" },
+                name: { type: "string" },
+              },
+            },
+          },
+          auto_adapt: { type: "boolean" },
+          scheduled_at: { type: "string" },
+        },
+      },
+    },
     {
       name: "delete_post",
       description: "Delete a post by ID",
       inputSchema: {
         type: "object",
         required: ["post_id"],
-        properties: {
-          post_id: { type: "string", description: "The post ID to delete" },
-        },
+        properties: { post_id: { type: "string" } },
       },
     },
-
-    // ── Jobs ───────────────────────────────────────────────────────────────
     {
       name: "get_job_status",
-      description:
-        "Check the status of an asynchronous Publer job (post creation, media upload, etc.). " +
-        "Poll this after schedule_post, publish_post_now, or upload_media_from_url.",
+      description: "Check the status of an asynchronous Publer job",
       inputSchema: {
         type: "object",
         required: ["job_id"],
-        properties: {
-          job_id: { type: "string", description: "Job ID returned by an async operation" },
-        },
+        properties: { job_id: { type: "string" } },
       },
     },
-
-    // ── Media ──────────────────────────────────────────────────────────────
     {
       name: "list_media",
-      description: "List media assets in the workspace media library",
+      description: "List media assets",
       inputSchema: {
         type: "object",
         properties: {
-          types: {
-            type: "array",
-            items: { type: "string", enum: ["photo", "video", "gif"] },
-            description: "Filter by media type(s)",
-          },
-          used: {
-            type: "array",
-            items: { type: "boolean" },
-            description: "Filter by usage status (true = used in a post, false = unused)",
-          },
-          source: {
-            type: "array",
-            items: {
-              type: "string",
-              enum: ["canva", "vista", "postnitro", "contentdrips", "openai", "favorites", "upload"],
-            },
-            description: "Filter by upload source",
-          },
-          ids: {
-            type: "array",
-            items: { type: "string" },
-            description: "Retrieve specific media items by ID",
-          },
-          search: {
-            type: "string",
-            description: "Full-text search on name or caption",
-          },
-          page: {
-            type: "number",
-            description: "Page number (0-based, default 0)",
-          },
+          types: { type: "array", items: { type: "string", enum: ["photo", "video", "gif"] } },
+          used: { type: "array", items: { type: "boolean" } },
+          source: { type: "array", items: { type: "string" } },
+          ids: { type: "array", items: { type: "string" } },
+          search: { type: "string" },
+          page: { type: "number" },
         },
       },
     },
-
     {
       name: "upload_media_from_url",
-      description:
-        "Upload one or more media files to the workspace library from public URLs. " +
-        "Returns a job_id — poll get_job_status to retrieve the resulting media IDs.",
+      description: "Upload media from URLs",
       inputSchema: {
         type: "object",
         required: ["media"],
         properties: {
-          media: {
-            type: "array",
-            description: "List of media items to upload",
-            items: {
-              type: "object",
-              required: ["url", "name"],
-              properties: {
-                url: { type: "string", description: "Publicly accessible URL of the file" },
-                name: { type: "string", description: "Display name for the asset" },
-                caption: { type: "string", description: "Optional caption" },
-                source: { type: "string", description: "Optional source label" },
-              },
-            },
-          },
-          in_library: {
-            type: "boolean",
-            description: "Save to the media library (default: true)",
-          },
-          direct_upload: {
-            type: "boolean",
-            description: "Upload directly to cloud storage",
-          },
+          media: { type: "array", items: { type: "object", required: ["url", "name"] } },
+          in_library: { type: "boolean" },
+          direct_upload: { type: "boolean" },
         },
       },
     },
-
     {
       name: "upload_media_file",
-      description:
-        "Upload a local file to the workspace media library. " +
-        "Provide an absolute path to a file on the machine running this MCP server. " +
-        "Returns the media object with id, path, type, width, height.",
+      description: "Upload a local file",
       inputSchema: {
         type: "object",
         required: ["file_path"],
         properties: {
-          file_path: {
-            type: "string",
-            description: "Absolute path to the local file to upload (max 200 MB)",
-          },
-          in_library: {
-            type: "boolean",
-            description: "Save to the media library (default: true)",
-          },
-          direct_upload: {
-            type: "boolean",
-            description: "Upload directly to cloud storage",
-          },
+          file_path: { type: "string" },
+          in_library: { type: "boolean" },
+          direct_upload: { type: "boolean" },
         },
       },
     },
-
     {
       name: "get_social_manager_instructions",
-      description:
-        "Get high-level instructions and best practices for managing social media with Publer. " +
-        "Use this to understand how to handle multi-platform campaigns, threading, and optimal scheduling.",
+      description: "Get high-level instructions and best practices",
       inputSchema: { type: "object", properties: {} },
     },
-
     {
       name: "split_content_into_thread",
-      description: "Intelligently split long text into a series of posts (a thread) for a specific platform.",
+      description: "Split long text into a thread",
       inputSchema: {
         type: "object",
         required: ["text", "platform"],
         properties: {
-          text: { type: "string", description: "The long content to split" },
-          platform: {
-            type: "string",
-            description: "Target platform (twitter, mastodon, threads, etc.)",
-          },
-          includeNumbering: {
-            type: "boolean",
-            description: "Whether to add (1/n) numbering to posts",
-            default: true,
-          },
+          text: { type: "string" },
+          platform: { type: "string" },
+          includeNumbering: { type: "boolean", default: true },
         },
       },
     },
-
     {
       name: "validate_post",
-      description: "Perform a 'sanity check' on a post's content and media against platform-specific constraints.",
+      description: "Sanity check a post against platform constraints",
       inputSchema: {
         type: "object",
         required: ["text", "platform"],
         properties: {
-          text: { type: "string", description: "The post caption" },
-          platform: { type: "string", description: "Target platform" },
-          media_count: { type: "number", description: "Number of media items attached" },
-          media_types: {
-            type: "array",
-            items: { type: "string" },
-            description: "Types of media (photo, video, gif)",
-          },
+          text: { type: "string" },
+          platform: { type: "string" },
+          media_count: { type: "number" },
+          media_types: { type: "array", items: { type: "string" } },
         },
       },
     },
-
     {
       name: "manage_account_presets",
-      description: "List, create, or delete reusable groups of social media accounts.",
+      description: "Manage reusable groups of social accounts",
       inputSchema: {
         type: "object",
         required: ["action"],
         properties: {
           action: { type: "string", enum: ["list", "create", "delete"] },
-          name: { type: "string", description: "Preset name (e.g. 'work')" },
-          account_ids: {
-            type: "array",
-            items: { type: "string" },
-            description: "Account IDs to include in the preset",
-          },
+          name: { type: "string" },
+          account_ids: { type: "array", items: { type: "string" } },
         },
       },
     },
-
     {
       name: "schedule_posts_bulk",
-      description: "Schedule multiple posts in a single request using Publer's bulk API.",
+      description: "Schedule multiple posts at once",
       inputSchema: {
         type: "object",
         required: ["posts"],
         properties: {
-          posts: {
-            type: "array",
-            items: {
-              type: "object",
-              required: ["account_ids", "text"],
-              properties: {
-                account_ids: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "Account IDs (supports @presets)",
-                },
-                text: { type: "string" },
-                scheduled_at: { type: "string" },
-                media_ids: { type: "array", items: { type: "string" } },
-                state: { type: "string" },
-              },
-            },
-          },
+          posts: { type: "array", items: { type: "object", required: ["account_ids", "text"] } },
         },
       },
     },
-
     {
       name: "cleanup_media",
-      description: "Bulk delete specified media assets from the library.",
+      description: "Bulk delete media assets",
       inputSchema: {
         type: "object",
         required: ["media_ids"],
-        properties: {
-          media_ids: { type: "array", items: { type: "string" } },
-        },
+        properties: { media_ids: { type: "array", items: { type: "string" } } },
       },
     },
   ],
 }));
 
-// ── Tool handlers ─────────────────────────────────────────────────────────────
-
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-
   try {
     switch (name) {
-      // ... (rest of cases)
-      case "manage_account_presets": {
-        const action = args!.action as "list" | "create" | "delete";
-        const presets = getPresets();
-
-        if (action === "list") {
-          return { content: [{ type: "text", text: JSON.stringify(presets, null, 2) }] };
-        }
-
-        const name = args!.name as string;
-        if (!name) throw new Error("Preset name is required for create/delete.");
-
-        if (action === "create") {
-          const ids = args!.account_ids as string[];
-          if (!ids || !ids.length) throw new Error("Account IDs are required for create.");
-          presets[name] = ids;
-          savePresets(presets);
-          return { content: [{ type: "text", text: `Preset '@${name}' created with ${ids.length} accounts.` }] };
-        }
-
-        if (action === "delete") {
-          delete presets[name];
-          savePresets(presets);
-          return { content: [{ type: "text", text: `Preset '@${name}' deleted.` }] };
-        }
-        throw new Error("Invalid action.");
-      }
-
-      case "schedule_posts_bulk": {
-        const posts = args!.posts as Array<Record<string, unknown>>;
-        const bulkPosts = posts.map(p => {
-          const accountIds = resolveAccountIds(p.account_ids as string[]);
-          const networks = buildNetworks(p.text as string, p.media_ids as string[] | undefined);
-          const accounts = accountIds.map(id => {
-            const entry: Record<string, unknown> = { id };
-            if (p.scheduled_at) entry.scheduled_at = p.scheduled_at;
-            return entry;
-          });
-          return { networks, accounts };
-        });
-
-        const res = await getClient().post("/posts/schedule", {
-          bulk: {
-            state: (args!.state as string) ?? "scheduled",
-            posts: bulkPosts,
-          }
-        });
-        return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
-      }
-
-      case "cleanup_media": {
-        const mediaIds = args!.media_ids as string[];
-        await getClient().delete("/media", { params: { "media_ids[]": mediaIds } });
-        return { content: [{ type: "text", text: `Successfully deleted ${mediaIds.length} media items.` }] };
-      }
-
-      case "split_content_into_thread": {
-        const text = args!.text as string;
-        const platformKey = normalizePlatform(args!.platform as string);
-        const config = PLATFORMS[platformKey] ?? PLATFORMS.twitter;
-        const includeNumbering = args!.includeNumbering !== false;
-
-        const limit = config.charLimit - (includeNumbering ? 8 : 0);
-        const parts: string[] = [];
-        
-        // Simple but effective paragraph/sentence aware splitter
-        let current = "";
-        const paragraphs = text.split("\n\n");
-        
-        for (const para of paragraphs) {
-          if ((current + para).length <= limit) {
-            current += (current ? "\n\n" : "") + para;
-          } else {
-            if (current) parts.push(current.trim());
-            
-            // If a single paragraph is too long, split by sentence
-            if (para.length > limit) {
-              const sentences = para.match(/[^.!?]+[.!?]+/g) || [para];
-              current = "";
-              for (const sentence of sentences) {
-                if ((current + sentence).length <= limit) {
-                  current += (current ? " " : "") + sentence;
-                } else {
-                  if (current) parts.push(current.trim());
-                  current = sentence;
-                  // If a single sentence is still too long, hard split (rare)
-                  while (current.length > limit) {
-                    parts.push(current.substring(0, limit).trim());
-                    current = current.substring(limit);
-                  }
-                }
-              }
-            } else {
-              current = para;
-            }
-          }
-        }
-        if (current) parts.push(current.trim());
-
-        const numberedParts = includeNumbering 
-          ? parts.map((p, i) => `${p} (${i + 1}/${parts.length})`)
-          : parts;
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                platform: config.name,
-                partCount: parts.length,
-                parts: numberedParts,
-              }, null, 2),
-            },
-          ],
-        };
-      }
-
-      case "validate_post": {
-        const text = args!.text as string;
-        const platformKey = normalizePlatform(args!.platform as string);
-        const config = PLATFORMS[platformKey];
-        
-        if (!config) {
-          return {
-            content: [{ type: "text", text: `Unknown platform: ${args!.platform}` }],
-            isError: true,
-          };
-        }
-
-        const errors: string[] = [];
-        if (text.length > config.charLimit) {
-          errors.push(`Text exceeds limit: ${text.length}/${config.charLimit} chars.`);
-        }
-
-        const mediaCount = (args!.media_count as number) || 0;
-        if (mediaCount > config.mediaLimit) {
-          errors.push(`Media count exceeds limit: ${mediaCount}/${config.mediaLimit} items.`);
-        }
-
-        const mediaTypes = (args!.media_types as string[]) || [];
-        for (const type of mediaTypes) {
-          if (!config.supportedMediaTypes.includes(type)) {
-            errors.push(`${config.name} does not support media type: ${type}`);
-          }
-        }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                valid: errors.length === 0,
-                platform: config.name,
-                errors: errors.length > 0 ? errors : undefined,
-              }, null, 2),
-            },
-          ],
-        };
-      }
-
-      case "get_social_manager_instructions": {
-        const projectRoot = path.resolve(new URL(import.meta.url).pathname, "..", "..");
-        const skillsDir = path.join(projectRoot, "skills");
-        let combinedContent = "";
-
-        if (fs.existsSync(skillsDir)) {
-          const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
-          for (const entry of entries) {
-            if (entry.isDirectory()) {
-              const skillMdPath = path.join(skillsDir, entry.name, "SKILL.md");
-              if (fs.existsSync(skillMdPath)) {
-                const content = fs.readFileSync(skillMdPath, "utf-8");
-                combinedContent += `\n--- SKILL: ${entry.name} ---\n${content}\n`;
-              }
-            }
-          }
-        }
-
-        if (!combinedContent) {
-          combinedContent = "High-level workflows for Publer Social Manager:\n" +
-            "1. Multi-platform adaptation: Use platform character limits.\n" +
-            "2. Threads: Use follow_up_text for comments/threads.\n" +
-            "3. Smart timing: Use get_best_times before scheduling.";
-        }
-        return { content: [{ type: "text", text: combinedContent }] };
-      }
-      // ── Users ────────────────────────────────────────────────────────────
       case "get_current_user": {
         const res = await getBaseClient().get("/users/me");
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
-      // ── Workspaces ───────────────────────────────────────────────────────
       case "list_workspaces": {
         const res = await getBaseClient().get("/workspaces");
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
-      // ── Accounts ─────────────────────────────────────────────────────────
       case "list_accounts": {
         const res = await getClient().get("/accounts");
+        let accounts = res.data as any[];
+        if (args?.provider) {
+          const p = (args.provider as string).toLowerCase();
+          accounts = accounts.filter(a => a.provider.toLowerCase().includes(p));
+        }
+        if (args?.capability) {
+          const cap = args.capability as string;
+          accounts = accounts.filter(a => {
+            const config = PLATFORMS[normalizePlatform(a.provider)];
+            if (!config) return false;
+            if (cap === "threading") return config.supportsThreading;
+            if (cap === "video") return config.supportedMediaTypes.includes("video");
+            if (cap === "photo") return config.supportedMediaTypes.includes("photo");
+            return true;
+          });
+        }
+        return { content: [{ type: "text", text: JSON.stringify(accounts, null, 2) }] };
+      }
+      case "get_platform_info": {
+        const res = await getClient().get("/accounts");
+        const accounts = res.data as any[];
+        const providers = Array.from(new Set(accounts.map(a => a.provider)));
+        const info = providers.map(p => ({
+          provider: p,
+          ...(PLATFORMS[normalizePlatform(p)] || { name: p, unknown: true })
+        }));
+        return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+      }
+      case "publish_with_media": {
+        const client = getClient();
+        const uploadRes = await client.post("/media/from-url", { media: args!.media_urls });
+        const jobResult = await pollJob(client, uploadRes.data.job_id);
+        if (jobResult.status === "failed") throw new Error(`Media upload failed: ${JSON.stringify(jobResult.payload?.failures)}`);
+        const mediaIds = (jobResult.payload as any[]).map(m => m.id);
+        const scheduleArgs = { ...args, media_ids: mediaIds, state: args!.scheduled_at ? "scheduled" : "published" };
+        const body = await buildScheduleBody(scheduleArgs, !!args!.scheduled_at, client);
+        const endpoint = args!.scheduled_at ? "/posts/schedule" : "/posts/schedule/publish";
+        const res = await client.post(endpoint, body);
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
-      // ── Posts ────────────────────────────────────────────────────────────
       case "list_posts": {
         const a = args ?? {};
-        const params: Record<string, unknown> = {};
+        const params: Record<string, any> = {};
         if (a.state) params.state = a.state;
         if (a.states) params["state[]"] = a.states;
         if (a.from) params.from = a.from;
@@ -849,146 +674,131 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (a.postType) params.postType = a.postType;
         if (a.member_id) params.member_id = a.member_id;
         if (a.page !== undefined) params.page = a.page;
-
         const res = await getClient().get("/posts", { params });
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
       case "get_post": {
         const res = await getClient().get(`/posts/${args!.post_id}`);
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
       case "update_post": {
         const a = args!;
-        const body: Record<string, unknown> = {};
+        const body: Record<string, any> = {};
         if (a.text) body.caption = a.text;
         if (a.scheduled_at) body.scheduled_at = a.scheduled_at;
         if (a.account_ids) body.account_ids = a.account_ids;
         if (a.label_ids) body.label_ids = a.label_ids;
-        if (a.media_ids) {
-          body.media = (a.media_ids as string[]).map(id => ({ id }));
-        }
-
+        if (a.media_ids) body.media = (a.media_ids as string[]).map(id => ({ id }));
         const res = await getClient().put(`/posts/${a.post_id}`, body);
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
       case "list_labels": {
         const res = await getClient().get("/labels");
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
       case "get_post_insights": {
-        const { account_id, from, to } = args! as { account_id?: string; from: string; to: string };
+        const { account_id, from, to } = args! as any;
         const path = account_id ? `/analytics/${account_id}/post_insights` : "/analytics/post_insights";
         const res = await getClient().get(path, { params: { from, to } });
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
       case "get_best_times": {
-        const { account_id } = args! as { account_id?: string };
+        const { account_id } = args! as any;
         const path = account_id ? `/analytics/${account_id}/best_times` : "/analytics/best_times";
         const res = await getClient().get(path);
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
       case "schedule_post": {
-        const body = buildScheduleBody(args as Record<string, unknown>, true);
-        const res = await getClient().post("/posts/schedule", body);
+        const client = getClient();
+        const body = await buildScheduleBody(args as any, true, client);
+        const res = await client.post("/posts/schedule", body);
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
       case "publish_post_now": {
-        const body = buildScheduleBody(args as Record<string, unknown>, false);
-        const res = await getClient().post("/posts/schedule/publish", body);
+        const client = getClient();
+        const body = await buildScheduleBody(args as any, false, client);
+        const res = await client.post("/posts/schedule/publish", body);
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
       case "delete_post": {
-        await getClient().delete("/posts", { params: { "post_ids[]": [args!.post_id] } });
-        return {
-          content: [{ type: "text", text: `Post ${args!.post_id} deleted successfully.` }],
-        };
+        await getClient().delete("/posts", { params: { "post_ids[]": args!.post_id } });
+        return { content: [{ type: "text", text: `Post ${args!.post_id} deleted.` }] };
       }
-
-      // ── Jobs ─────────────────────────────────────────────────────────────
       case "get_job_status": {
         const res = await getClient().get(`/job_status/${args!.job_id}`);
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
-      // ── Media ────────────────────────────────────────────────────────────
       case "list_media": {
         const a = args ?? {};
-        const params: Record<string, unknown> = {};
+        const params: Record<string, any> = {};
         if (a.types) params["types[]"] = a.types;
         if (a.used) params["used[]"] = a.used;
         if (a.source) params["source[]"] = a.source;
         if (a.ids) params["ids[]"] = a.ids;
         if (a.search) params.search = a.search;
         if (a.page !== undefined) params.page = a.page;
-
         const res = await getClient().get("/media", { params });
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
       case "upload_media_from_url": {
-        const body: Record<string, unknown> = { media: args!.media };
-        if (args!.in_library !== undefined) body.in_library = args!.in_library;
-        if (args!.direct_upload !== undefined) body.direct_upload = args!.direct_upload;
-
-        const res = await getClient().post("/media/from-url", body);
+        const res = await getClient().post("/media/from-url", args);
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
       case "upload_media_file": {
         const filePath = args!.file_path as string;
-        const resolved = path.resolve(filePath);
-
-        if (!fs.existsSync(resolved)) {
-          throw new Error(`File not found: ${resolved}`);
-        }
-
         const form = new FormData();
-        form.append("file", fs.createReadStream(resolved));
+        form.append("file", fs.createReadStream(path.resolve(filePath)));
         if (args!.in_library !== undefined) form.append("in_library", String(args!.in_library));
-        if (args!.direct_upload !== undefined) form.append("direct_upload", String(args!.direct_upload));
-
-        const workspaceId = process.env.PUBLER_WORKSPACE_ID;
-        const token = process.env.PUBLER_API_TOKEN;
-        if (!token) throw new Error("PUBLER_API_TOKEN is not set.");
-        if (!workspaceId) throw new Error("PUBLER_WORKSPACE_ID is not set.");
-
         const res = await axios.post(`${PUBLER_API_BASE}/media`, form, {
-          headers: {
-            ...form.getHeaders(),
-            Authorization: `Bearer-API ${token}`,
-            "Publer-Workspace-Id": workspaceId,
-          },
-          maxBodyLength: 210 * 1024 * 1024, // 210 MB
+          headers: { ...form.getHeaders(), Authorization: `Bearer-API ${process.env.PUBLER_API_TOKEN}`, "Publer-Workspace-Id": process.env.PUBLER_WORKSPACE_ID },
+          maxBodyLength: 210 * 1024 * 1024,
         });
         return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
       }
-
-      default:
-        throw new Error(`Unknown tool: ${name}`);
+      case "manage_account_presets": {
+        const action = args!.action as any;
+        const presets = getPresets();
+        if (action === "list") return { content: [{ type: "text", text: JSON.stringify(presets, null, 2) }] };
+        const name = args!.name as string;
+        if (action === "create") { presets[name] = args!.account_ids as string[]; savePresets(presets); return { content: [{ type: "text", text: `Preset @${name} created.` }] }; }
+        if (action === "delete") { delete presets[name]; savePresets(presets); return { content: [{ type: "text", text: `Preset @${name} deleted.` }] }; }
+        throw new Error("Invalid action");
+      }
+      case "schedule_posts_bulk": {
+        const client = getClient();
+        const posts = args!.posts as any[];
+        const bulkPosts = [];
+        for (const p of posts) {
+          const networks = await enrichNetworks(p.text, p.media_ids, resolveAccountIds(p.account_ids), client);
+          const accounts = resolveAccountIds(p.account_ids).map(id => ({ id, scheduled_at: p.scheduled_at }));
+          bulkPosts.push({ networks, accounts });
+        }
+        const res = await client.post("/posts/schedule", { bulk: { state: "scheduled", posts: bulkPosts } });
+        return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
+      }
+      case "cleanup_media": {
+        await getClient().delete("/media", { params: { "media_ids[]": args!.media_ids } });
+        return { content: [{ type: "text", text: `Deleted.` }] };
+      }
+      case "get_social_manager_instructions": {
+        const skillsDir = path.join(path.resolve(new URL(import.meta.url).pathname, "..", ".."), "skills");
+        let combined = "";
+        if (fs.existsSync(skillsDir)) {
+          for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
+            if (entry.isDirectory()) {
+              const p = path.join(skillsDir, entry.name, "SKILL.md");
+              if (fs.existsSync(p)) combined += `\n--- ${entry.name} ---\n${fs.readFileSync(p, "utf-8")}\n`;
+            }
+          }
+        }
+        return { content: [{ type: "text", text: combined || "Social Manager instructions..." }] };
+      }
+      default: throw new Error(`Unknown tool: ${name}`);
     }
-  } catch (err: unknown) {
-    const message = axios.isAxiosError(err)
-      ? `Publer API error ${err.response?.status}: ${JSON.stringify(err.response?.data)}`
-      : err instanceof Error
-      ? err.message
-      : String(err);
-
-    return {
-      content: [{ type: "text", text: `Error: ${message}` }],
-      isError: true,
-    };
+  } catch (err) {
+    return wrapError(err);
   }
 });
-
-// ── Start ─────────────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

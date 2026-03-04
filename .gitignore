@@ -7,7 +7,7 @@ dist/
 deno.lock
 
 # Tests
-tests/
+# tests/
 
 # Skills
 AI_copywriting.md

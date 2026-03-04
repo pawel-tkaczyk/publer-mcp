@@ -445,7 +445,7 @@ async function main() {
   
   let shouldInstallSkill = false;
   if (picks.size > 0) {
-    const installSkill = await rl.question("  Would you like to install the Publer Agent Skills (Social Manager & AI Copywriter) for the selected agent(s)? [Y/n] ");
+    const installSkill = await rl.question("  Would you like to install the Publer Agent Skills (Social Manager) for the selected agent(s)? [Y/n] ");
     shouldInstallSkill = installSkill.toLowerCase() !== "n";
   } else {
     warn("No agents selected. Skipping skill installation.");
